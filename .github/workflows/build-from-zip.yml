@@ -1,0 +1,83 @@
+name: Build APK from uploaded ZIP
+
+# For people who cannot extract files (e.g. working only from a phone):
+#   1. Upload the project ZIP (amar-dokan-pro.zip) to the ROOT of your repository (branch: main).
+#   2. Add THIS file as .github/workflows/build-from-zip.yml (GitHub web: Add file -> Create new file).
+#   3. Actions tab -> "Build APK from uploaded ZIP" -> Run workflow (it also runs on every push to main).
+# The workflow unzips the ZIP by itself and builds the debug APK. If there is no ZIP in the
+# repository root, every step is skipped (so it is harmless in a repo that has the extracted files).
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find and unzip project
+        id: unzip
+        run: |
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "No .zip file in the repository root - nothing to do."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Using $ZIP"
+          rm -rf _project && mkdir -p _project
+          unzip -q "$ZIP" -d _project
+          SETTINGS=$(find _project -maxdepth 3 -name settings.gradle | head -n 1)
+          if [ -z "$SETTINGS" ]; then echo "settings.gradle not found inside $ZIP"; exit 1; fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "dir=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        if: steps.unzip.outputs.found == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: steps.unzip.outputs.found == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.7
+        if: steps.unzip.outputs.found == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Inject Firebase web config (optional secret FIREBASE_CONFIG_JS)
+        if: steps.unzip.outputs.found == 'true'
+        env:
+          FIREBASE_CONFIG_JS: ${{ secrets.FIREBASE_CONFIG_JS }}
+          PROJECT_DIR: ${{ steps.unzip.outputs.dir }}
+        run: |
+          if [ -n "$FIREBASE_CONFIG_JS" ]; then
+            printf '%s\n' "$FIREBASE_CONFIG_JS" > "$PROJECT_DIR/web/firebase-config.js"
+            echo "firebase-config.js replaced from secret"
+          fi
+
+      - name: Build debug APK
+        if: steps.unzip.outputs.found == 'true'
+        working-directory: ${{ steps.unzip.outputs.dir }}
+        env:
+          WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+        run: gradle assembleDebug --stacktrace -PwebClientId="$WEB_CLIENT_ID"
+
+      - name: Upload APK
+        if: steps.unzip.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmarDokanPro-debug-apk
+          path: ${{ steps.unzip.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

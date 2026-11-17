@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="bn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="color-scheme" content="light dark">
+  <title>AMAR DOKAN PRO</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Splash while Firebase loads -->
+  <div id="boot" class="boot">
+    <div class="boot-logo">
+      <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l1.5-5h15L21 9"/><path d="M3 9a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0"/><path d="M5 12v8h14v-8"/><path d="M10 20v-5h4v5"/></svg>
+    </div>
+    <div class="boot-name">AMAR DOKAN PRO</div>
+    <div class="spinner"></div>
+  </div>
+
+  <!-- Login / onboarding / error screens are rendered here -->
+  <div id="screen" hidden></div>
+
+  <!-- Main application shell -->
+  <div id="app" class="shell" hidden>
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="main-col">
+      <header class="topbar" id="topbar"></header>
+      <main id="view" class="content" tabindex="-1"></main>
+    </div>
+    <nav class="bottomnav" id="bottomnav"></nav>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toasts" aria-live="polite"></div>
+
+  <noscript>JavaScript is required / জাভাস্ক্রিপ্ট চালু করুন</noscript>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

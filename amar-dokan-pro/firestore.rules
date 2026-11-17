@@ -1,0 +1,268 @@
+rules_version = '2';
+
+// AMAR DOKAN PRO - Firestore security rules
+// All permission checks are enforced HERE (server side). Hiding buttons in the UI is only cosmetic.
+//
+// Data layout:
+//   shops/{shopId}                       shop profile + settings (ownerUid is immutable)
+//   shops/{shopId}/members/{uid}         role + permission flags for each signed-in user
+//   shops/{shopId}/products              name, sellPrice, stock ...   (NO purchase cost)
+//   shops/{shopId}/productCosts          purchase price + history      (needs viewCost / profit)
+//   shops/{shopId}/sales                 invoices (NO cost / profit)
+//   shops/{shopId}/saleCosts             cost + profit per invoice     (needs viewCost / profit)
+//   shops/{shopId}/transactions          every money movement          (needs finance)
+//   shops/{shopId}/accountBalances       running balances              (needs finance)
+//   invites/{email}                      pending invitations
+//   userShops/{uid}                      which shop a user belongs to
+//   userPrefs/{uid}                      language / theme of that user
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------ helpers
+    function signedIn() {
+      return request.auth != null;
+    }
+    function verified() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+    function shopPath(shopId) {
+      return /databases/$(database)/documents/shops/$(shopId);
+    }
+    function memberPath(shopId) {
+      return /databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid);
+    }
+    function invitePath() {
+      return /databases/$(database)/documents/invites/$(myEmail());
+    }
+    function isMember(shopId) {
+      return signedIn() && exists(memberPath(shopId));
+    }
+    function me(shopId) {
+      return get(memberPath(shopId)).data;
+    }
+    function isOwner(shopId) {
+      return isMember(shopId) && me(shopId).role == 'owner';
+    }
+    // owner always passes, others need the permission flag set to true by the owner
+    function can(shopId, perm) {
+      return isMember(shopId)
+        && (me(shopId).role == 'owner' || me(shopId).perms.get(perm, false) == true);
+    }
+    // used for "increment only" updates made by people who sell / collect / pay
+    function onlyKeys(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // ------------------------------------------------------------------ validators
+    function validProduct() {
+      let d = request.resource.data;
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 120
+        && d.sellPrice is number && d.sellPrice >= 0 && d.sellPrice < 100000000
+        && d.stock is number;
+    }
+    function validCustomer() {
+      let d = request.resource.data;
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 100
+        && d.due is number;
+    }
+    function validSale() {
+      let d = request.resource.data;
+      return d.total is number && d.total >= 0
+        && d.paid is number && d.paid >= 0
+        && d.due is number && d.due >= 0
+        && d.lines is list && d.lines.size() > 0 && d.lines.size() <= 200
+        && d.date is string && d.date.size() == 10
+        && d.status in ['active', 'voided'];
+    }
+    function validTx() {
+      let d = request.resource.data;
+      return d.accountId is string && d.amount is number && d.delta is number
+        && d.date is string && d.date.size() == 10;
+    }
+    function validAccount() {
+      let d = request.resource.data;
+      return d.name is string && d.name.size() <= 60 && d.type is string;
+    }
+    function validExpense() {
+      let d = request.resource.data;
+      return d.amount is number && d.amount > 0 && d.amount < 1000000000
+        && d.date is string && d.date.size() == 10 && d.category is string;
+    }
+    function validPurchase() {
+      let d = request.resource.data;
+      return d.qty is number && d.qty > 0 && d.total is number && d.total >= 0
+        && d.date is string && d.date.size() == 10;
+    }
+    // which role may write which kind of transaction
+    function txAllowed(shopId, type) {
+      return (type == 'sale' && can(shopId, 'sell'))
+        || (type == 'due_collection' && can(shopId, 'customers'))
+        || (type == 'expense' && can(shopId, 'expenses'))
+        || (type == 'purchase' && can(shopId, 'viewCost'))
+        || (type in ['deposit', 'withdraw', 'transfer_in', 'transfer_out', 'charge', 'adjustment', 'opening']
+            && can(shopId, 'finance'));
+    }
+
+    // ------------------------------------------------------------------ shops
+    match /shops/{shopId} {
+      allow read: if isMember(shopId);
+      // creating a shop: you become its owner (the members doc is created in the same batch)
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if can(shopId, 'settings')
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if false;
+
+      // ---------------------------------------------------------------- members
+      match /members/{uid} {
+        allow read: if signedIn() && (uid == request.auth.uid || isOwner(shopId));
+
+        allow create: if signedIn() && uid == request.auth.uid
+          && request.resource.data.email == myEmail()
+          && (
+            // 1) bootstrap: creator of a brand-new shop becomes owner
+            (request.resource.data.role == 'owner'
+              && !exists(shopPath(shopId))
+              && getAfter(shopPath(shopId)).data.ownerUid == request.auth.uid)
+            ||
+            // 2) join: a verified Google account that the owner invited by e-mail,
+            //    with exactly the role + permissions written in the invitation
+            (verified()
+              && exists(invitePath())
+              && get(invitePath()).data.shopId == shopId
+              && get(invitePath()).data.role == request.resource.data.role
+              && get(invitePath()).data.perms == request.resource.data.perms)
+          );
+
+        // only the owner changes roles / permissions; nobody can create a second owner
+        allow update: if isOwner(shopId)
+          && (uid == get(shopPath(shopId)).data.ownerUid
+              || request.resource.data.role in ['manager', 'employee']);
+        allow delete: if (isOwner(shopId) || uid == request.auth.uid)
+          && uid != get(shopPath(shopId)).data.ownerUid;
+      }
+
+      // ---------------------------------------------------------------- products
+      match /products/{id} {
+        allow read: if isMember(shopId);
+        allow create: if can(shopId, 'products') && validProduct();
+        allow update: if (can(shopId, 'products') && validProduct())
+          || (can(shopId, 'sell') && onlyKeys(['stock', 'updatedAt']));
+        allow delete: if can(shopId, 'products');
+      }
+
+      // purchase prices: invisible to anyone without viewCost / profit
+      match /productCosts/{id} {
+        allow read: if can(shopId, 'viewCost') || can(shopId, 'profit');
+        allow write: if can(shopId, 'viewCost');
+      }
+
+      // ---------------------------------------------------------------- customers
+      match /customers/{id} {
+        allow read: if can(shopId, 'customers') || can(shopId, 'sell');
+        allow create: if (can(shopId, 'customers') || can(shopId, 'sell')) && validCustomer();
+        allow update: if (can(shopId, 'customers') && validCustomer())
+          || (can(shopId, 'sell') && onlyKeys(['due', 'updatedAt']));
+        allow delete: if can(shopId, 'customers') && can(shopId, 'deleteRecords');
+      }
+
+      match /payments/{id} {
+        allow read: if can(shopId, 'customers') || can(shopId, 'finance');
+        allow create, update: if can(shopId, 'customers')
+          && request.resource.data.amount is number && request.resource.data.amount > 0
+          && request.resource.data.createdBy == request.auth.uid;
+        allow delete: if can(shopId, 'customers') && can(shopId, 'deleteRecords');
+      }
+
+      // ---------------------------------------------------------------- sales
+      match /sales/{id} {
+        // employees only see their own invoices unless the owner grants viewAllSales
+        allow read: if can(shopId, 'viewAllSales')
+          || (isMember(shopId) && resource.data.createdBy == request.auth.uid);
+        allow create: if can(shopId, 'sell')
+          && request.resource.data.createdBy == request.auth.uid && validSale();
+        // voiding an invoice
+        allow update: if can(shopId, 'deleteRecords')
+          && onlyKeys(['status', 'voidedAt', 'voidedBy']);
+        allow delete: if false;
+      }
+
+      // cost + profit of each invoice: never readable by plain employees
+      match /saleCosts/{id} {
+        allow read: if can(shopId, 'viewCost') || can(shopId, 'profit');
+        allow create, update, delete: if can(shopId, 'viewCost') || can(shopId, 'profit');
+      }
+
+      // ---------------------------------------------------------------- money
+      match /accounts/{id} {
+        allow read: if can(shopId, 'sell') || can(shopId, 'finance')
+          || can(shopId, 'expenses') || can(shopId, 'customers');
+        allow create, update: if can(shopId, 'finance') && validAccount();
+        allow delete: if can(shopId, 'finance');
+      }
+
+      // balances are write-only for people who just sell / collect / pay
+      match /accountBalances/{id} {
+        allow read: if can(shopId, 'finance');
+        allow create, update: if can(shopId, 'finance')
+          || ((can(shopId, 'sell') || can(shopId, 'customers') || can(shopId, 'expenses')
+               || can(shopId, 'viewCost') || can(shopId, 'products'))
+              && request.resource.data.keys().hasOnly(['balance', 'updatedAt']));
+        allow delete: if can(shopId, 'finance');
+      }
+
+      match /transactions/{id} {
+        allow read: if can(shopId, 'finance');
+        allow create, update: if txAllowed(shopId, request.resource.data.type) && validTx();
+        allow delete: if can(shopId, 'finance')
+          || (can(shopId, 'deleteRecords')
+              && resource.data.type in ['sale', 'due_collection', 'expense', 'purchase']);
+      }
+
+      match /expenses/{id} {
+        allow read: if can(shopId, 'expenses') || can(shopId, 'finance') || can(shopId, 'profit');
+        allow create, update: if can(shopId, 'expenses') && validExpense();
+        allow delete: if can(shopId, 'expenses') && can(shopId, 'deleteRecords');
+      }
+
+      match /purchases/{id} {
+        allow read: if can(shopId, 'viewCost');
+        allow create, update: if can(shopId, 'viewCost') && validPurchase();
+        allow delete: if can(shopId, 'viewCost') && can(shopId, 'deleteRecords');
+      }
+
+      // logo / background image
+      match /meta/{docId} {
+        allow read: if isMember(shopId);
+        allow write: if can(shopId, 'settings');
+      }
+    }
+
+    // ------------------------------------------------------------------ invitations
+    // document id = invited Gmail address in lower case
+    match /invites/{email} {
+      allow read: if verified()
+        && (email == myEmail() || (resource != null && isOwner(resource.data.shopId)));
+      allow create, update: if isOwner(request.resource.data.shopId)
+        && request.resource.data.email == email
+        && request.resource.data.role in ['manager', 'employee'];
+      allow delete: if isOwner(resource.data.shopId) || (verified() && email == myEmail());
+    }
+
+    // ------------------------------------------------------------------ per-user docs
+    match /userShops/{uid} {
+      allow read: if signedIn() && uid == request.auth.uid;
+      allow create: if signedIn() && uid == request.auth.uid
+        && existsAfter(memberPath(request.resource.data.shopId));
+      allow update: if false;
+      allow delete: if signedIn() && (uid == request.auth.uid || isOwner(resource.data.shopId));
+    }
+
+    match /userPrefs/{uid} {
+      allow read, write: if signedIn() && uid == request.auth.uid;
+    }
+  }
+}
